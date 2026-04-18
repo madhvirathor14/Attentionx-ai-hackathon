@@ -1,140 +1,123 @@
 """
-face_tracker.py
+audio_analyzer.py
 
-Samples frames from a video segment and returns a smoothed trajectory of
-the speaker's face X-position (normalized 0–1).  Used by video_processor
-to keep the speaker centred in the 9:16 crop.
+Finds emotionally intense / high-energy moments in a video's audio track.
+Strategy: compute RMS energy + spectral rolloff, smooth the curve, then
+find peaks that are at least `min_gap` seconds apart.
 
-We sample every SAMPLE_INTERVAL frames instead of every single frame to
-keep processing fast — then interpolate between sampled positions.
+These candidates are passed to the AI step which picks the best ones by
+actual content quality — not just loudness.
 """
 
-import cv2
+import librosa
 import numpy as np
-import mediapipe as mp
+from scipy.signal import find_peaks
+from typing import List, Tuple
 import logging
-from typing import Dict, Tuple, Optional, List
 
 logger = logging.getLogger(__name__)
 
-SAMPLE_INTERVAL = 12   # Detect face every 12 frames (~0.4s at 30fps)
 
-
-def build_face_trajectory(
-    video_path: str,
-    start_sec: float,
-    end_sec: float,
-    fps: Optional[float] = None,
-) -> Dict[int, float]:
+def find_emotional_peaks(
+    audio_path: str,
+    min_duration: float = 45.0,
+    top_n: int = 6,
+) -> List[Tuple[float, float, float]]:
     """
-    Build a frame_number → normalized_face_cx mapping for the given segment.
+    Scan audio and return candidate time windows sorted by energy score.
 
-    - Samples every SAMPLE_INTERVAL frames with MediaPipe
-    - Fills gaps with linear interpolation
-    - Missing detections inherit the nearest known position
+    Args:
+        audio_path:    Path to extracted WAV/MP3 file.
+        min_duration:  Minimum clip length we want (seconds).
+        top_n:         How many candidates to surface.
 
-    Returns: dict mapping absolute frame numbers to face center X (0–1 range).
+    Returns:
+        List of (start_sec, end_sec, score) sorted best → worst.
     """
-    cap = cv2.VideoCapture(video_path)
-    if fps is None:
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    logger.info("Loading audio for energy analysis…")
+    y, sr = librosa.load(audio_path, sr=None, mono=True)
+    total_dur = len(y) / sr
+    logger.info(f"Duration: {total_dur:.1f}s  |  SR: {sr} Hz")
 
-    start_frame = int(start_sec * fps)
-    end_frame   = int(end_sec   * fps)
+    # ── Feature extraction ──────────────────────────────────────────────────
+    # 0.5s frames, 0.25s hop → 4 frames/sec resolution
+    frame_len = int(sr * 0.5)
+    hop = int(sr * 0.25)
 
-    detector = mp.solutions.face_detection.FaceDetection(
-        model_selection=1,          # Full-range model (handles distant faces)
-        min_detection_confidence=0.35,
-    )
+    rms = librosa.feature.rms(y=y, frame_length=frame_len, hop_length=hop)[0]
+    rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr, hop_length=hop)[0]
+    zcr = librosa.feature.zero_crossing_rate(y, frame_length=frame_len, hop_length=hop)[0]
+    times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop)
 
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    def _norm(arr):
+        lo, hi = arr.min(), arr.max()
+        return (arr - lo) / (hi - lo + 1e-9)
 
-    sampled: Dict[int, float] = {}   # frame → cx
-    last_cx = 0.5                    # default to center
+    # Combined score: RMS is king, rolloff & ZCR add "speech passion" signal
+    score = 0.65 * _norm(rms) + 0.20 * _norm(rolloff) + 0.15 * _norm(zcr)
 
-    frame_idx = start_frame
-    while frame_idx < end_frame:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    # Smooth over ~6s window to favour sustained energy over quick bursts
+    smooth_win = max(1, int(6.0 / 0.25))
+    score_smooth = np.convolve(score, np.ones(smooth_win) / smooth_win, mode="same")
 
-        should_sample = ((frame_idx - start_frame) % SAMPLE_INTERVAL == 0)
+    # ── Peak detection ───────────────────────────────────────────────────────
+    min_gap_frames = int(min_duration / 0.25)
+    threshold = np.percentile(score_smooth, 35)   # ignore bottom 35%
 
-        if should_sample:
-            cx = _detect_face_cx(frame, detector)
-            if cx is not None:
-                last_cx = cx
-            sampled[frame_idx] = last_cx
+    peaks, _ = find_peaks(score_smooth, distance=min_gap_frames, height=threshold)
 
-        frame_idx += 1
+    # ── Build segments around each peak ─────────────────────────────────────
+    half = min_duration / 2.0
+    candidates: List[Tuple[float, float, float]] = []
 
-    cap.release()
-    detector.close()
+    for p in peaks:
+        t_peak = float(times[p])
+        seg_start = max(0.0, t_peak - half)
+        seg_end = min(total_dur, seg_start + min_duration)
 
-    if not sampled:
-        logger.warning("No faces detected in segment — defaulting to center crop.")
-        return {f: 0.5 for f in range(start_frame, end_frame)}
+        # Edge case: near end of video
+        if seg_end >= total_dur - 3:
+            seg_end = max(0, total_dur - 2)
+            seg_start = max(0.0, seg_end - min_duration)
 
-    # ── Interpolate to fill every frame ─────────────────────────────────────
-    full_traj = _interpolate(sampled, start_frame, end_frame)
-
-    # ── Smooth with a Gaussian window to prevent jitter ─────────────────────
-    frame_keys = sorted(full_traj.keys())
-    cx_values  = np.array([full_traj[k] for k in frame_keys], dtype=float)
-
-    from scipy.ndimage import gaussian_filter1d
-    cx_smooth = gaussian_filter1d(cx_values, sigma=fps * 0.8)   # 0.8s smoothing
-
-    smoothed = {k: float(cx_smooth[i]) for i, k in enumerate(frame_keys)}
-    return smoothed
-
-
-def _detect_face_cx(frame: np.ndarray, detector) -> Optional[float]:
-    """
-    Run MediaPipe on a single BGR frame.
-    Returns normalized X of the face bounding-box center, or None.
-    """
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = detector.process(rgb)
-
-    if not results.detections:
-        return None
-
-    # Pick the highest-confidence detection
-    best = max(results.detections, key=lambda d: d.score[0])
-    bbox = best.location_data.relative_bounding_box
-
-    cx = bbox.xmin + bbox.width  / 2.0
-    # clamp to valid range
-    return float(np.clip(cx, 0.05, 0.95))
-
-
-def _interpolate(
-    sampled: Dict[int, float],
-    start: int,
-    end: int,
-) -> Dict[int, float]:
-    """Linear interpolation between sampled face positions."""
-    keys   = sorted(sampled.keys())
-    result: Dict[int, float] = {}
-
-    for f in range(start, end):
-        if f in sampled:
-            result[f] = sampled[f]
+        if seg_end - seg_start < 15:
             continue
 
-        # Find surrounding keyframes
-        prev_k = next((k for k in reversed(keys) if k <= f), None)
-        next_k = next((k for k in keys if k >= f),          None)
+        seg_score = float(score_smooth[p])
+        candidates.append((round(seg_start, 2), round(seg_end, 2), seg_score))
 
-        if prev_k is None:
-            result[f] = sampled[next_k]
-        elif next_k is None:
-            result[f] = sampled[prev_k]
-        elif prev_k == next_k:
-            result[f] = sampled[prev_k]
-        else:
-            t = (f - prev_k) / (next_k - prev_k)
-            result[f] = sampled[prev_k] + t * (sampled[next_k] - sampled[prev_k])
+    # ── Fallback: divide into equal chunks if no peaks found ────────────────
+    if not candidates:
+        logger.warning("No clear peaks found — using uniform chunk fallback.")
+        chunk = min_duration
+        n = max(1, int(total_dur / chunk))
+        for i in range(n):
+            s = i * chunk
+            e = min(total_dur, s + chunk)
+            fi_s = int(s / 0.25)
+            fi_e = min(int(e / 0.25), len(score_smooth))
+            chunk_score = float(score_smooth[fi_s:fi_e].mean()) if fi_e > fi_s else 0.0
+            candidates.append((round(s, 2), round(e, 2), chunk_score))
 
-    return result
+    # ── Deduplicate overlapping segments, keep highest score ────────────────
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    kept: List[Tuple[float, float, float]] = []
+
+    for cand in candidates:
+        too_close = False
+        for ex in kept:
+            overlap_start = max(cand[0], ex[0])
+            overlap_end = min(cand[1], ex[1])
+            if overlap_end - overlap_start > 10:  # >10s overlap → skip
+                too_close = True
+                break
+        if not too_close:
+            kept.append(cand)
+        if len(kept) >= top_n:
+            break
+
+    logger.info(f"Returning {len(kept)} candidate windows.")
+    for i, (s, e, sc) in enumerate(kept):
+        logger.info(f"  [{i+1}] {s:.1f}s → {e:.1f}s  score={sc:.3f}")
+
+    return kept
