@@ -10,19 +10,18 @@ logger = logging.getLogger(__name__)
 def transcribe_audio(audio_path: str) -> Dict[str, Any]:
     client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
-    # Compress WAV to small MP3 to stay under Groq's 25MB limit
-    mp3_path = audio_path.replace(".wav", ".mp3")
+    # Trim audio to first 10 min using moviepy (avoids 25MB Groq limit)
+    trimmed_path = audio_path.replace(".wav", "_trimmed.wav")
     try:
-        import subprocess
-        subprocess.run([
-            "ffmpeg", "-i", audio_path,
-            "-ar", "16000", "-ac", "1", "-b:a", "32k",
-            "-y", mp3_path
-        ], capture_output=True, check=True)
-        send_path = mp3_path
-        logger.info(f"Compressed: {Path(mp3_path).stat().st_size/1e6:.1f}MB")
+        from moviepy.editor import AudioFileClip
+        clip = AudioFileClip(audio_path).subclip(0, min(600, AudioFileClip(audio_path).duration))
+        clip.write_audiofile(trimmed_path, fps=16000, nbytes=2, verbose=False, logger=None)
+        clip.close()
+        send_path = trimmed_path
+        size_mb = Path(send_path).stat().st_size / 1e6
+        logger.info(f"Trimmed audio: {size_mb:.1f}MB")
     except Exception as e:
-        logger.warning(f"Compression failed, using original: {e}")
+        logger.warning(f"Trim failed: {e} — using original")
         send_path = audio_path
 
     logger.info(f"Sending {Path(send_path).stat().st_size/1e6:.1f}MB to Groq Whisper")
@@ -56,14 +55,13 @@ def transcribe_audio(audio_path: str) -> Dict[str, Any]:
                 "end":   float(w.get("end", 0)),
             })
     else:
-        logger.warning("No word timestamps — interpolating from segments.")
         words = _interpolate_word_timestamps(segments)
 
-    logger.info(f"Transcript: {len(full_text)} chars | {len(segments)} segs | {len(words)} words")
+    logger.info(f"Done: {len(full_text)} chars | {len(segments)} segs | {len(words)} words")
     return {"text": full_text, "segments": segments, "words": words}
 
 
-def _interpolate_word_timestamps(segments: List[Dict]) -> List[Dict]:
+def _interpolate_word_timestamps(segments):
     words = []
     for seg in segments:
         seg_words = seg["text"].strip().split()
